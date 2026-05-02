@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TypedDict, TypeVar
 
 
-EXTRACTOR_VERSION = "1.3.4"
+EXTRACTOR_VERSION = "1.3.5"
 T = TypeVar("T")
 
 
@@ -445,17 +445,40 @@ def collect_aoe_skills(
 def confirmed_skill_key(event: AbilityEvent, index: EventIndex) -> tuple[str, str]:
     if event.source_selectable_values == {True}:
         return (event.name, event.action_id)
-    if event.source_selectable_values != {False} or len(event.source_entity_ids) != 1:
+    if event.source_selectable_values != {False}:
         return (event.name, event.action_id)
 
-    source_entity_id = next(iter(event.source_entity_ids))
-    parent_cast = find_selectable_parent_cast(event, source_entity_id, index)
+    parent_cast = find_selectable_parent_cast(event, index)
     if parent_cast is None:
         return (event.name, event.action_id)
     return (parent_cast.name, parent_cast.action_id)
 
 
-def find_selectable_parent_cast(event: AbilityEvent, source_entity_id: str, index: EventIndex, parent_window_ms: int = 15000) -> CastEvent | None:
+def find_selectable_parent_cast(event: AbilityEvent, index: EventIndex, parent_window_ms: int = 15000) -> CastEvent | None:
+    if len(event.source_entity_ids) == 1:
+        source_entity_id = next(iter(event.source_entity_ids))
+        return find_selectable_parent_cast_for_source(event, source_entity_id, index, parent_window_ms)
+
+    parent_casts: dict[tuple[int, str, str, str], CastEvent] = {}
+    for source_entity_id in event.source_entity_ids:
+        parent_cast = find_selectable_parent_cast_for_source(event, source_entity_id, index, parent_window_ms)
+        if parent_cast is None:
+            continue
+        key = (parent_cast.timestamp_ms, parent_cast.source_entity_id, parent_cast.name, parent_cast.action_id)
+        parent_casts[key] = parent_cast
+
+    if len(parent_casts) != 1:
+        # 多个不可选中来源只有共同指向同一个可选中父读条时才归并，避免跨来源误判。
+        return None
+    return next(iter(parent_casts.values()))
+
+
+def find_selectable_parent_cast_for_source(
+    event: AbilityEvent,
+    source_entity_id: str,
+    index: EventIndex,
+    parent_window_ms: int,
+) -> CastEvent | None:
     child_cast: CastEvent | None = None
     for cast in index.casts_by_name.get(event.name, []):
         if cast.source_selectable:
