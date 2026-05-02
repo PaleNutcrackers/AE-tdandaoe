@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TypedDict, TypeVar
 
 
-EXTRACTOR_VERSION = "1.3.2"
+EXTRACTOR_VERSION = "1.3.4"
 T = TypeVar("T")
 
 
@@ -60,16 +60,29 @@ def new_target_set() -> set[str]:
     return set()
 
 
+def new_bool_set() -> set[bool]:
+    return set()
+
+
 @dataclass(slots=True)
 class AbilityEvent:
     timestamp: str
     timestamp_ms: int
     action_id: str
     name: str
+    source_name: str
+    source_entity_id: str
+    source_selectable: bool
+    source_entity_ids: set[str] = field(default_factory=new_target_set)
+    source_selectable_values: set[bool] = field(default_factory=new_bool_set)
     targets: set[str] = field(default_factory=new_target_set)
 
     def add_target(self, target_entity_id: str) -> None:
         self.targets.add(target_entity_id)
+
+    def add_source(self, source_entity_id: str, source_selectable: bool) -> None:
+        self.source_entity_ids.add(source_entity_id)
+        self.source_selectable_values.add(source_selectable)
 
 
 @dataclass(slots=True)
@@ -377,6 +390,7 @@ def collect_parent_skills_with_derived_casts(
 
 def collect_aoe_skills(
     hits: list[AbilityHit],
+    index: EventIndex,
     min_targets: int,
     event_window_ms: int,
     include_blank_names: bool,
@@ -385,8 +399,6 @@ def collect_aoe_skills(
     events: dict[tuple[str, str], list[AbilityEvent]] = {}
 
     for hit in hits:
-        if action_id_filter and hit.action_id not in action_id_filter:
-            continue
         if not hit.name and not include_blank_names:
             continue
 
@@ -402,8 +414,17 @@ def collect_aoe_skills(
             None,
         )
         if event is None:
-            event = AbilityEvent(hit.timestamp, hit.timestamp_ms, hit.action_id, hit.name)
+            event = AbilityEvent(
+                hit.timestamp,
+                hit.timestamp_ms,
+                hit.action_id,
+                hit.name,
+                hit.source_name,
+                hit.source_entity_id,
+                hit.source_selectable,
+            )
             event_group.append(event)
+        event.add_source(hit.source_entity_id, hit.source_selectable)
         event.add_target(hit.target_entity_id)
 
     skills: dict[tuple[str, str], int] = {}
@@ -413,10 +434,52 @@ def collect_aoe_skills(
             if target_count < min_targets:
                 continue
 
-            skill_key = (event.name, event.action_id)
+            skill_key = confirmed_skill_key(event, index)
+            if action_id_filter and event.action_id not in action_id_filter and skill_key[1] not in action_id_filter:
+                continue
             skills[skill_key] = max(skills.get(skill_key, 0), target_count)
 
     return skills
+
+
+def confirmed_skill_key(event: AbilityEvent, index: EventIndex) -> tuple[str, str]:
+    if event.source_selectable_values == {True}:
+        return (event.name, event.action_id)
+    if event.source_selectable_values != {False} or len(event.source_entity_ids) != 1:
+        return (event.name, event.action_id)
+
+    source_entity_id = next(iter(event.source_entity_ids))
+    parent_cast = find_selectable_parent_cast(event, source_entity_id, index)
+    if parent_cast is None:
+        return (event.name, event.action_id)
+    return (parent_cast.name, parent_cast.action_id)
+
+
+def find_selectable_parent_cast(event: AbilityEvent, source_entity_id: str, index: EventIndex, parent_window_ms: int = 15000) -> CastEvent | None:
+    child_cast: CastEvent | None = None
+    for cast in index.casts_by_name.get(event.name, []):
+        if cast.source_selectable:
+            continue
+        if cast.source_entity_id != source_entity_id:
+            continue
+        delay_ms = event.timestamp_ms - cast.timestamp_ms
+        if not 0 <= delay_ms <= parent_window_ms:
+            continue
+        if child_cast is None or cast.timestamp_ms > child_cast.timestamp_ms:
+            child_cast = cast
+
+    if child_cast is None:
+        return None
+
+    for cast in reversed(index.casts_by_name.get(event.name, [])):
+        if not cast.source_selectable:
+            continue
+        if cast.timestamp_ms > child_cast.timestamp_ms:
+            continue
+        if child_cast.timestamp_ms - cast.timestamp_ms > 1000:
+            continue
+        return cast
+    return None
 
 
 def merge_skill_counts(
@@ -448,14 +511,37 @@ def candidate_hits_for_skill(name: str, action_id: str, index: EventIndex) -> li
     return unique_by_identity(index.hits_by_action.get(action_id, []) + index.hits_by_name.get(name, []))
 
 
-def score_confirmation_candidate(action_id: str, cast: CastEvent, hit: AbilityHit, has_derived_cast: bool, delay_ms: int) -> tuple[int, int, int, int]:
-    # 元组越小越优先：真实玩家目标 > ID 精确匹配 > 有派生读条证据 > 延迟更短。
+def count_window_targets(hit: AbilityHit, index: EventIndex, target_window_ms: int) -> int:
+    targets: set[str] = set()
+    for candidate in index.hits_by_action_name.get((hit.action_id, hit.name), []):
+        if candidate.source_entity_id != hit.source_entity_id:
+            continue
+        if abs(candidate.timestamp_ms - hit.timestamp_ms) > target_window_ms:
+            continue
+        targets.add(candidate.target_entity_id)
+    return len(targets)
+
+
+def score_confirmation_candidate(
+    action_id: str,
+    expected_count: int,
+    direct_target_count: int,
+    cast: CastEvent,
+    hit: AbilityHit,
+    has_derived_cast: bool,
+    delay_ms: int,
+) -> tuple[int, int, int, int, int, int]:
+    # 元组越小越优先：真实玩家目标 > 目标数足够/更多 > ID 精确匹配 > 有派生读条证据 > 延迟更短。
     prefer_non_self_target = 0 if hit.target_entity_id != hit.source_entity_id else 1
+    prefer_enough_targets = 0 if direct_target_count >= expected_count else 1
+    prefer_more_targets = -direct_target_count
     prefer_exact_hit_id = 0 if hit.action_id == action_id else 1
     prefer_exact_cast_id = 0 if cast.action_id == action_id else 1
     prefer_derived_cast_match = 0 if has_derived_cast else 1
     return (
         prefer_non_self_target,
+        prefer_enough_targets,
+        prefer_more_targets,
         prefer_exact_hit_id + prefer_exact_cast_id,
         prefer_derived_cast_match,
         delay_ms,
@@ -472,7 +558,7 @@ def find_skill_confirmation(
     target_window_ms: int,
     linked_target_window_ms: int,
 ) -> OutputDetail | None:
-    best_score: tuple[int, int, int, int] | None = None
+    best_score: tuple[int, int, int, int, int, int] | None = None
     best_detail: OutputDetail | None = None
     best_cast: CastEvent | None = None
     best_hit: AbilityHit | None = None
@@ -504,7 +590,16 @@ def find_skill_confirmation(
             if hit.action_id != action_id and hit.name != name:
                 continue
 
-            score = score_confirmation_candidate(action_id, cast, hit, has_matching_derived_cast(hit, cast), delay_ms)
+            direct_target_count = count_window_targets(hit, index, target_window_ms)
+            score = score_confirmation_candidate(
+                action_id,
+                expected_count,
+                direct_target_count,
+                cast,
+                hit,
+                has_matching_derived_cast(hit, cast),
+                delay_ms,
+            )
             if best_score is None or score < best_score:
                 best_score = score
                 best_detail = OutputDetail(
@@ -806,6 +901,7 @@ def main() -> int:
     if args.all:
         confirmed = collect_aoe_skills(
             parsed_logs.hits,
+            event_index,
             args.min_targets,
             args.event_window_ms,
             args.include_blank_names,
@@ -889,6 +985,7 @@ def main() -> int:
     else:
         skills = collect_aoe_skills(
             parsed_logs.hits,
+            event_index,
             args.min_targets,
             args.event_window_ms,
             args.include_blank_names,

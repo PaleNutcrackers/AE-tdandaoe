@@ -49,7 +49,7 @@ python extract_aoe_skills.py -all "Log-2354965 - 副本.log" --output-format jso
 文本输出首行包含提取器版本，例如：
 
 ```text
-来自[1.3.2]提取器
+来自[1.3.4]提取器
 ```
 
 ## 注意
