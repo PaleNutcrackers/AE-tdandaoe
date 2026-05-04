@@ -38,6 +38,11 @@ python extract_aoe_skills.py -all "Log-2354965 - 副本.log" --output-format jso
 - `--target-window-ms`：同一命中目标聚合窗口，默认 `500`。
 - `--linked-target-window-ms`：派生命中后续链接目标收集窗口，默认 `1500`。
 
+## 玩家预过滤
+
+脚本会先扫描 `Unit创建` / `Unit消失`，优先把 `DataId: 0` 的 `EntityId` 视为玩家候选，再只统计这些已知玩家目标。
+如果当前日志没有这类记录，脚本会自动退化为不做这层额外过滤。
+
 ## 目标过滤
 
 所有模式只保留命中到可选中目标的 `AbilityEffect` 记录，避免不可选中目标进入结果。
@@ -53,7 +58,7 @@ python extract_aoe_skills.py -all "Log-2354965 - 副本.log" --output-format jso
 文本输出首行包含提取器版本，例如：
 
 ```text
-来自[1.3.6]提取器
+来自[1.3.7]提取器
 ```
 
 ## 注意

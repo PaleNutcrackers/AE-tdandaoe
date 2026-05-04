@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TypedDict, TypeVar
 
 
-EXTRACTOR_VERSION = "1.3.6"
+EXTRACTOR_VERSION = "1.3.7"
 T = TypeVar("T")
 
 
@@ -40,6 +40,23 @@ ABILITY_RE = re.compile(
     r"\s+DataId:\s*(?P<target_data_id>\d+)"
     r"\s+EntityId:\s*(?P<target_entity_id>\d+)"
     r"\s+可选中:\s*(?P<target_selectable>True|False)",
+    re.DOTALL,
+)
+
+UNIT_CREATE_RE = re.compile(
+    r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}(?:\s+[+-]\d{2}:\d{2})?)"
+    r".*?Unit创建\s+Name:\s*(?P<name>.*?)"
+    r"\s+DataId:\s*(?P<data_id>\d+)"
+    r"\s+EntityId:\s*(?P<entity_id>\d+)"
+    r"\s+可选中:\s*(?P<selectable>True|False)",
+    re.DOTALL,
+)
+
+UNIT_DISAPPEAR_RE = re.compile(
+    r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}(?:\s+[+-]\d{2}:\d{2})?)"
+    r".*?Unit消失\s+Name:\s*(?P<name>.*?)"
+    r"\s+DataId:\s*(?P<data_id>\d+)"
+    r"\s+EntityId:\s*(?P<entity_id>\d+)",
     re.DOTALL,
 )
 
@@ -62,6 +79,10 @@ def new_target_set() -> set[str]:
 
 
 def new_bool_set() -> set[bool]:
+    return set()
+
+
+def new_catalog_set() -> set[str]:
     return set()
 
 
@@ -122,6 +143,15 @@ class OutputDetail:
     hit_targets: str
 
 
+@dataclass(slots=True)
+class EntityCatalog:
+    player_entity_ids: set[str] = field(default_factory=new_catalog_set)
+    active_entity_ids: set[str] = field(default_factory=new_catalog_set)
+
+    def should_keep_entity(self, entity_id: str) -> bool:
+        return not self.player_entity_ids or entity_id in self.player_entity_ids
+
+
 def new_cast_list() -> list[CastEvent]:
     return []
 
@@ -162,6 +192,7 @@ class OutputRecord(TypedDict):
 class ParsedLogData:
     casts: list[CastEvent] = field(default_factory=new_cast_list)
     hits: list[AbilityHit] = field(default_factory=new_hit_list)
+    entity_catalog: EntityCatalog = field(default_factory=EntityCatalog)
 
 
 @dataclass(slots=True)
@@ -231,9 +262,32 @@ def parse_action_ids(raw_action_ids: str) -> set[str]:
     return {action_id.strip() for action_id in raw_action_ids.split(",") if action_id.strip()}
 
 
-def parse_log_data(log_paths: list[Path], encoding: str) -> ParsedLogData:
+def build_entity_catalog(log_paths: list[Path], encoding: str) -> EntityCatalog:
+    # 先扫一遍 Unit 创建/消失，建立 EntityId → 玩家候选 的预过滤目录。
+    # 约定：DataId 为 0 的创建行优先视为玩家/角色实体；若日志没有这类记录，则退化为不过滤。
+    catalog = EntityCatalog()
+    for log_path in log_paths:
+        for record in iter_records(read_log_text(log_path, encoding)):
+            if "Unit创建" in record:
+                match = UNIT_CREATE_RE.search(record)
+                if not match:
+                    continue
+                entity_id = match.group("entity_id")
+                catalog.active_entity_ids.add(entity_id)
+                if match.group("data_id") == "0" or match.group("selectable") == "True":
+                    catalog.player_entity_ids.add(entity_id)
+                continue
+            if "Unit消失" in record:
+                match = UNIT_DISAPPEAR_RE.search(record)
+                if not match:
+                    continue
+                catalog.active_entity_ids.discard(match.group("entity_id"))
+    return catalog
+
+
+def parse_log_data(log_paths: list[Path], encoding: str, entity_catalog: EntityCatalog | None = None) -> ParsedLogData:
     # 统一入口：日志只解析一次，后续分类、补全、输出都复用 casts/hits。
-    parsed = ParsedLogData()
+    parsed = ParsedLogData(entity_catalog=entity_catalog or EntityCatalog())
     for log_path in log_paths:
         for record in iter_records(read_log_text(log_path, encoding)):
             if "读条时间:" in record:
@@ -259,6 +313,9 @@ def parse_log_data(log_paths: list[Path], encoding: str) -> ParsedLogData:
                     if match.group("target_selectable") != "True":
                         continue
                     source_name, source_data_id, source_entity_id, source_selectable = parse_actor_fields(match.group("source"))
+                    target_entity_id = match.group("target_entity_id")
+                    if not parsed.entity_catalog.should_keep_entity(target_entity_id):
+                        continue
                     parsed.hits.append(
                         AbilityHit(
                             timestamp=match.group("timestamp"),
@@ -270,7 +327,7 @@ def parse_log_data(log_paths: list[Path], encoding: str) -> ParsedLogData:
                             source_entity_id=source_entity_id,
                             source_selectable=source_selectable,
                             target_name=match.group("target_name").strip(),
-                            target_entity_id=match.group("target_entity_id"),
+                            target_entity_id=target_entity_id,
                             target_selectable=True,
                         )
                     )
@@ -396,6 +453,7 @@ def collect_parent_skills_with_derived_casts(
 def collect_aoe_skills(
     hits: list[AbilityHit],
     index: EventIndex,
+    entity_catalog: EntityCatalog,
     min_targets: int,
     event_window_ms: int,
     include_blank_names: bool,
@@ -405,6 +463,8 @@ def collect_aoe_skills(
 
     for hit in hits:
         if not hit.name and not include_blank_names:
+            continue
+        if not entity_catalog.should_keep_entity(hit.target_entity_id):
             continue
 
         # 同一技能在短窗口内命中多个唯一目标，直接视为确认 AOE。
@@ -539,10 +599,12 @@ def candidate_hits_for_skill(name: str, action_id: str, index: EventIndex) -> li
     return unique_by_identity(index.hits_by_action.get(action_id, []) + index.hits_by_name.get(name, []))
 
 
-def count_window_targets(hit: AbilityHit, index: EventIndex, target_window_ms: int) -> int:
+def count_window_targets(hit: AbilityHit, index: EventIndex, entity_catalog: EntityCatalog, target_window_ms: int) -> int:
     targets: set[str] = set()
     for candidate in index.hits_by_action_name.get((hit.action_id, hit.name), []):
         if candidate.source_entity_id != hit.source_entity_id:
+            continue
+        if not entity_catalog.should_keep_entity(candidate.target_entity_id):
             continue
         if abs(candidate.timestamp_ms - hit.timestamp_ms) > target_window_ms:
             continue
@@ -582,6 +644,7 @@ def find_skill_confirmation(
     expected_count: int,
     hits: list[AbilityHit],
     index: EventIndex,
+    entity_catalog: EntityCatalog,
     max_delay_ms: int,
     target_window_ms: int,
     linked_target_window_ms: int,
@@ -618,7 +681,7 @@ def find_skill_confirmation(
             if hit.action_id != action_id and hit.name != name:
                 continue
 
-            direct_target_count = count_window_targets(hit, index, target_window_ms)
+            direct_target_count = count_window_targets(hit, index, entity_catalog, target_window_ms)
             score = score_confirmation_candidate(
                 action_id,
                 expected_count,
@@ -648,6 +711,8 @@ def find_skill_confirmation(
                 continue
             if abs(hit.timestamp_ms - best_hit.timestamp_ms) > target_window_ms:
                 continue
+            if not entity_catalog.should_keep_entity(hit.target_entity_id):
+                continue
 
             targets[hit.target_entity_id] = hit.target_name or hit.target_entity_id
 
@@ -662,6 +727,8 @@ def find_skill_confirmation(
                     continue
                 if hit.target_entity_id == hit.source_entity_id:
                     continue
+                if not entity_catalog.should_keep_entity(hit.target_entity_id):
+                    continue
 
                 targets[hit.target_entity_id] = hit.target_name or hit.target_entity_id
 
@@ -675,6 +742,7 @@ def enrich_skill_rows(
     casts: list[CastEvent],
     hits: list[AbilityHit],
     index: EventIndex,
+    entity_catalog: EntityCatalog,
     max_delay_ms: int,
     target_window_ms: int,
     linked_target_window_ms: int,
@@ -688,6 +756,7 @@ def enrich_skill_rows(
             count,
             hits,
             index,
+            entity_catalog,
             max_delay_ms,
             target_window_ms,
             linked_target_window_ms,
@@ -915,7 +984,8 @@ def main() -> int:
 
     action_id_filter = parse_action_ids(args.action_ids)
 
-    parsed_logs = parse_log_data(log_paths, args.encoding)
+    entity_catalog = build_entity_catalog(log_paths, args.encoding)
+    parsed_logs = parse_log_data(log_paths, args.encoding, entity_catalog)
     event_index = build_event_index(parsed_logs.casts, parsed_logs.hits)
 
     output_lines: list[str] = []
@@ -930,6 +1000,7 @@ def main() -> int:
         confirmed = collect_aoe_skills(
             parsed_logs.hits,
             event_index,
+            entity_catalog,
             args.min_targets,
             args.event_window_ms,
             args.include_blank_names,
@@ -963,6 +1034,7 @@ def main() -> int:
             parsed_logs.casts,
             parsed_logs.hits,
             event_index,
+            entity_catalog,
             args.max_effect_delay_ms,
             args.target_window_ms,
             args.linked_target_window_ms,
@@ -972,6 +1044,7 @@ def main() -> int:
             parsed_logs.casts,
             parsed_logs.hits,
             event_index,
+            entity_catalog,
             args.max_effect_delay_ms,
             args.target_window_ms,
             args.linked_target_window_ms,
@@ -981,6 +1054,7 @@ def main() -> int:
             parsed_logs.casts,
             parsed_logs.hits,
             event_index,
+            entity_catalog,
             args.max_effect_delay_ms,
             args.target_window_ms,
             args.linked_target_window_ms,
@@ -1006,6 +1080,7 @@ def main() -> int:
             parsed_logs.casts,
             parsed_logs.hits,
             event_index,
+            entity_catalog,
             args.max_effect_delay_ms,
             args.target_window_ms,
             args.linked_target_window_ms,
@@ -1014,6 +1089,7 @@ def main() -> int:
         skills = collect_aoe_skills(
             parsed_logs.hits,
             event_index,
+            entity_catalog,
             args.min_targets,
             args.event_window_ms,
             args.include_blank_names,
@@ -1035,6 +1111,7 @@ def main() -> int:
             parsed_logs.casts,
             parsed_logs.hits,
             event_index,
+            entity_catalog,
             args.max_effect_delay_ms,
             args.target_window_ms,
             args.linked_target_window_ms,
