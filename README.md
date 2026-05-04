@@ -38,6 +38,10 @@ python extract_aoe_skills.py -all "Log-2354965 - 副本.log" --output-format jso
 - `--target-window-ms`：同一命中目标聚合窗口，默认 `500`。
 - `--linked-target-window-ms`：派生命中后续链接目标收集窗口，默认 `1500`。
 
+## 目标过滤
+
+所有模式只保留命中到可选中目标的 `AbilityEffect` 记录，避免不可选中目标进入结果。
+
 ## 输出说明
 
 `--all` 模式按优先级去重输出：
@@ -49,7 +53,7 @@ python extract_aoe_skills.py -all "Log-2354965 - 副本.log" --output-format jso
 文本输出首行包含提取器版本，例如：
 
 ```text
-来自[1.3.5]提取器
+来自[1.3.6]提取器
 ```
 
 ## 注意

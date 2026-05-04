@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TypedDict, TypeVar
 
 
-EXTRACTOR_VERSION = "1.3.5"
+EXTRACTOR_VERSION = "1.3.6"
 T = TypeVar("T")
 
 
@@ -38,7 +38,8 @@ ABILITY_RE = re.compile(
     r"\s+Source:\s*(?P<source>.*?)"
     r"\s+Target:\s*Name:\s*(?P<target_name>.*?)"
     r"\s+DataId:\s*(?P<target_data_id>\d+)"
-    r"\s+EntityId:\s*(?P<target_entity_id>\d+)",
+    r"\s+EntityId:\s*(?P<target_entity_id>\d+)"
+    r"\s+可选中:\s*(?P<target_selectable>True|False)",
     re.DOTALL,
 )
 
@@ -109,6 +110,7 @@ class AbilityHit:
     source_selectable: bool
     target_name: str
     target_entity_id: str
+    target_selectable: bool
 
 
 @dataclass(slots=True)
@@ -254,6 +256,8 @@ def parse_log_data(log_paths: list[Path], encoding: str) -> ParsedLogData:
             if "AbilityEffect" in record:
                 match = ABILITY_RE.search(record)
                 if match:
+                    if match.group("target_selectable") != "True":
+                        continue
                     source_name, source_data_id, source_entity_id, source_selectable = parse_actor_fields(match.group("source"))
                     parsed.hits.append(
                         AbilityHit(
@@ -267,6 +271,7 @@ def parse_log_data(log_paths: list[Path], encoding: str) -> ParsedLogData:
                             source_selectable=source_selectable,
                             target_name=match.group("target_name").strip(),
                             target_entity_id=match.group("target_entity_id"),
+                            target_selectable=True,
                         )
                     )
     return parsed
