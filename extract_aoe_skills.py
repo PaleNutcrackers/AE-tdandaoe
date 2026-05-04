@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TypedDict, TypeVar
 
 
-EXTRACTOR_VERSION = "1.3.7"
+EXTRACTOR_VERSION = "1.3.9"
 T = TypeVar("T")
 
 
@@ -188,6 +188,10 @@ class OutputRecord(TypedDict):
     hit_targets: str
 
 
+class ValidationRecord(OutputRecord):
+    validation_status: str
+
+
 @dataclass(slots=True)
 class ParsedLogData:
     casts: list[CastEvent] = field(default_factory=new_cast_list)
@@ -260,6 +264,20 @@ def parse_action_ids(raw_action_ids: str) -> set[str]:
     if not raw_action_ids:
         return set()
     return {action_id.strip() for action_id in raw_action_ids.split(",") if action_id.strip()}
+
+
+def load_action_id_file(path: Path) -> set[str]:
+    raw_ids = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw_ids, list):
+        raise ValueError("Action ID file must be a JSON array")
+    return {str(action_id) for action_id in raw_ids}
+
+
+def numeric_text(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        return 0
 
 
 def build_entity_catalog(log_paths: list[Path], encoding: str) -> EntityCatalog:
@@ -345,6 +363,18 @@ def build_event_index(casts: list[CastEvent], hits: list[AbilityHit]) -> EventIn
         index.hits_by_action.setdefault(hit.action_id, []).append(hit)
         index.hits_by_name.setdefault(hit.name, []).append(hit)
         index.hits_by_action_name.setdefault((hit.action_id, hit.name), []).append(hit)
+    for cast_list in index.casts_by_action.values():
+        cast_list.sort(key=lambda cast: cast.timestamp_ms)
+    for cast_list in index.casts_by_name.values():
+        cast_list.sort(key=lambda cast: cast.timestamp_ms)
+    for cast_list in index.casts_by_action_name.values():
+        cast_list.sort(key=lambda cast: cast.timestamp_ms)
+    for hit_list in index.hits_by_action.values():
+        hit_list.sort(key=lambda hit: hit.timestamp_ms)
+    for hit_list in index.hits_by_name.values():
+        hit_list.sort(key=lambda hit: hit.timestamp_ms)
+    for hit_list in index.hits_by_action_name.values():
+        hit_list.sort(key=lambda hit: hit.timestamp_ms)
     return index
 
 
@@ -417,12 +447,10 @@ def collect_parent_skills_with_derived_casts(
     min_derived_casts: int,
 ) -> dict[tuple[str, str], int]:
     skills: dict[tuple[str, str], int] = {}
-    candidate_children = index.casts_by_name.get(derived_name_filter, []) if derived_name_filter else casts
-    # TODO(仅需关注,无任何实质性证据): 后续如需依赖下面的 break 提前退出，先按 timestamp_ms 排序。
-    # 说明：多日志文件目前按文件名顺序解析，不保证等同于时间顺序；如果同名子施法跨文件乱序，
-    # 先遇到 delta_ms > derived_window_ms 的未来事件时，理论上可能跳过后面仍在窗口内的事件。
+    ordered_casts = sorted(casts, key=lambda cast: cast.timestamp_ms)
+    candidate_children = index.casts_by_name.get(derived_name_filter, []) if derived_name_filter else ordered_casts
 
-    for parent in casts:
+    for parent in ordered_casts:
         if not passes_filter(parent.name, parent.action_id, parent.source_name, parent.source_selectable, source_name_filter, action_id_filter):
             continue
 
@@ -461,7 +489,7 @@ def collect_aoe_skills(
 ) -> dict[tuple[str, str], int]:
     events: dict[tuple[str, str], list[AbilityEvent]] = {}
 
-    for hit in hits:
+    for hit in sorted(hits, key=lambda hit: hit.timestamp_ms):
         if not hit.name and not include_blank_names:
             continue
         if not entity_catalog.should_keep_entity(hit.target_entity_id):
@@ -509,8 +537,6 @@ def collect_aoe_skills(
 
 def confirmed_skill_key(event: AbilityEvent, index: EventIndex) -> tuple[str, str]:
     if event.source_selectable_values == {True}:
-        return (event.name, event.action_id)
-    if event.source_selectable_values != {False}:
         return (event.name, event.action_id)
 
     parent_cast = find_selectable_parent_cast(event, index)
@@ -777,10 +803,17 @@ def format_output_line(name: str, action_id: str, detail: OutputDetail, with_cou
     return f"{common}\t{detail.delay_ms}\t{detail.ability_name}/{detail.ability_id}\t{detail.hit_targets}"
 
 
+def sorted_detail_items(rows: dict[tuple[str, str], OutputDetail]) -> list[tuple[tuple[str, str], OutputDetail]]:
+    return sorted(
+        rows.items(),
+        key=lambda item: (numeric_text(item[0][1]), item[0][0], numeric_text(item[1].ability_id), item[1].ability_name),
+    )
+
+
 def format_category_block(title: str, rows: dict[tuple[str, str], OutputDetail]) -> list[str]:
     lines = [f"[{title}]"]
     lines.append("技能名\tID\t数量\t技能使用到AbilityEffect耗时ms\tAbilityEffect名称/ID\t命中目标")
-    for (name, action_id), detail in rows.items():
+    for (name, action_id), detail in sorted_detail_items(rows):
         lines.append(format_output_line(name, action_id, detail))
     lines.append("")
     return lines
@@ -801,10 +834,24 @@ def detail_record(category: str, name: str, action_id: str, detail: OutputDetail
 
 
 def category_records(category: str, rows: dict[tuple[str, str], OutputDetail]) -> list[OutputRecord]:
-    return [detail_record(category, name, action_id, detail) for (name, action_id), detail in rows.items()]
+    return [detail_record(category, name, action_id, detail) for (name, action_id), detail in sorted_detail_items(rows)]
+
+
+def sort_output_records(records: list[OutputRecord]) -> list[OutputRecord]:
+    return sorted(
+        records,
+        key=lambda record: (
+            numeric_text(record["skill_id"]),
+            record["skill_name"],
+            record["category"],
+            numeric_text(record["ability_id"]),
+            record["ability_name"],
+        ),
+    )
 
 
 def write_structured_output(output_path: Path, version: str, records: list[OutputRecord], output_format: str) -> None:
+    records = sort_output_records(records)
     if output_format == "json":
         with output_path.open("w", encoding="utf-8", newline="\n") as output:
             json.dump({"version": version, "records": records}, output, ensure_ascii=False, indent=2)
@@ -820,6 +867,60 @@ def write_structured_output(output_path: Path, version: str, records: list[Outpu
         return
 
     raise ValueError(f"Unsupported output format: {output_format}")
+
+
+def validation_status(record: OutputRecord, action_ids: set[str]) -> str:
+    if record["skill_id"] in action_ids:
+        return "matched_skill_id"
+    if record["ability_id"] in action_ids:
+        return "matched_ability_id"
+    return "missing_from_actions"
+
+
+def validation_records(records: list[OutputRecord], action_ids: set[str]) -> list[ValidationRecord]:
+    validated: list[ValidationRecord] = []
+    for record in sort_output_records(records):
+        validated.append({**record, "validation_status": validation_status(record, action_ids)})
+    return validated
+
+
+def write_validation_output(output_path: Path, version: str, records: list[OutputRecord], action_ids: set[str], output_format: str) -> None:
+    validated = validation_records(records, action_ids)
+    summary = {
+        "total": len(validated),
+        "matched_skill_id": sum(1 for record in validated if record["validation_status"] == "matched_skill_id"),
+        "matched_ability_id": sum(1 for record in validated if record["validation_status"] == "matched_ability_id"),
+        "missing_from_actions": sum(1 for record in validated if record["validation_status"] == "missing_from_actions"),
+    }
+
+    if output_format == "json":
+        with output_path.open("w", encoding="utf-8", newline="\n") as output:
+            json.dump({"version": version, "validation_summary": summary, "records": validated}, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+        return
+
+    if output_format == "csv":
+        fieldnames = ["validation_status", "category", "source_name", "skill_name", "skill_id", "count", "delay_ms", "ability_name", "ability_id", "hit_targets"]
+        with output_path.open("w", encoding="utf-8-sig", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            _ = writer.writeheader()
+            writer.writerows(validated)
+        return
+
+    with output_path.open("w", encoding="utf-8", newline="\n") as output:
+        output.write(f"来自[{version}]提取器\n")
+        output.write("[AoeActions校验]\n")
+        output.write(f"total\t{summary['total']}\n")
+        output.write(f"matched_skill_id\t{summary['matched_skill_id']}\n")
+        output.write(f"matched_ability_id\t{summary['matched_ability_id']}\n")
+        output.write(f"missing_from_actions\t{summary['missing_from_actions']}\n\n")
+        output.write("状态\t分类\t技能名\tID\t数量\t技能使用到AbilityEffect耗时ms\tAbilityEffect名称/ID\t命中目标\n")
+        for record in validated:
+            if record["validation_status"] != "missing_from_actions":
+                continue
+            output.write(
+                f"{record['validation_status']}\t{record['category']}\t{record['skill_name']}\t{record['skill_id']}\t{record['count']}\t{record['delay_ms']}\t{record['ability_name']}/{record['ability_id']}\t{record['hit_targets']}\n"
+            )
 
 
 def default_log_paths(workdir: Path) -> list[Path]:
@@ -937,6 +1038,17 @@ def parse_args() -> argparse.Namespace:
         help="Window after a derived AbilityEffect for linked follow-up hit targets. Default: 1500",
     )
     parser.add_argument(
+        "--validate-actions",
+        type=Path,
+        default=None,
+        help="Compare extracted rows against an AoeActions.json ID list and output missing IDs.",
+    )
+    parser.add_argument(
+        "--no-player-prefilter",
+        action="store_true",
+        help="Disable Unit创建/Unit消失 player EntityId prefilter. The prefilter is enabled by default.",
+    )
+    parser.add_argument(
         "-all",
         "--all",
         action="store_true",
@@ -984,7 +1096,7 @@ def main() -> int:
 
     action_id_filter = parse_action_ids(args.action_ids)
 
-    entity_catalog = build_entity_catalog(log_paths, args.encoding)
+    entity_catalog = EntityCatalog() if args.no_player_prefilter else build_entity_catalog(log_paths, args.encoding)
     parsed_logs = parse_log_data(log_paths, args.encoding, entity_catalog)
     event_index = build_event_index(parsed_logs.casts, parsed_logs.hits)
 
@@ -1132,7 +1244,11 @@ def main() -> int:
     else:
         structured_records.extend(category_records("aoe", skill_details))
 
-    if args.output_format != "txt":
+    if args.validate_actions is not None:
+        action_path = args.validate_actions if args.validate_actions.is_absolute() else script_dir / args.validate_actions
+        action_ids = load_action_id_file(action_path)
+        write_validation_output(output_path, EXTRACTOR_VERSION, structured_records, action_ids, args.output_format)
+    elif args.output_format != "txt":
         write_structured_output(output_path, EXTRACTOR_VERSION, structured_records, args.output_format)
     else:
         with output_path.open("w", encoding="utf-8", newline="\n") as output:
@@ -1141,7 +1257,10 @@ def main() -> int:
                 output.write("\n".join(output_lines))
                 output.write("\n")
             elif args.from_casts:
-                for (source_name, name, action_id), cast_count in cast_skills.items():
+                for (source_name, name, action_id), cast_count in sorted(
+                    cast_skills.items(),
+                    key=lambda item: (numeric_text(item[0][2]), item[0][1], item[0][0]),
+                ):
                     detail = cast_details.get((name, action_id))
                     if detail is None:
                         continue
@@ -1156,7 +1275,7 @@ def main() -> int:
                             f"{prefix}\t{detail.delay_ms}\t{detail.ability_name}/{detail.ability_id}\t{detail.hit_targets}\n"
                         )
             else:
-                for (name, action_id), detail in skill_details.items():
+                for (name, action_id), detail in sorted_detail_items(skill_details):
                     if args.with_count:
                         output.write(format_output_line(name, action_id, detail) + "\n")
                     else:

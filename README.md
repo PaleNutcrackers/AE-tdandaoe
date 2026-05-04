@@ -28,6 +28,12 @@ python extract_aoe_skills.py -all "Log-2354965 - 副本.log" --action-ids 49975,
 python extract_aoe_skills.py -all "Log-2354965 - 副本.log" --output-format json -o aoe_skills.json
 ```
 
+使用已确认 AOE ID 列表校验输出：
+
+```bash
+python extract_aoe_skills.py -all "Log-2354965 - 副本.log" --validate-actions AoeActions.json -o validate_actions.txt
+```
+
 ## 常用参数
 
 - `-all`, `--all`：输出确认 AOE、高度疑似 AOE、疑似 AOE 三类结果。
@@ -37,6 +43,8 @@ python extract_aoe_skills.py -all "Log-2354965 - 副本.log" --output-format jso
 - `--output-format`：输出格式，支持 `txt`、`csv`、`json`。
 - `--target-window-ms`：同一命中目标聚合窗口，默认 `500`。
 - `--linked-target-window-ms`：派生命中后续链接目标收集窗口，默认 `1500`。
+- `--validate-actions`：加载 `AoeActions.json`，按现有提取结果输出未收录 ID。
+- `--no-player-prefilter`：关闭玩家 EntityId 预过滤；默认启用。
 
 ## 玩家预过滤
 
@@ -58,7 +66,7 @@ python extract_aoe_skills.py -all "Log-2354965 - 副本.log" --output-format jso
 文本输出首行包含提取器版本，例如：
 
 ```text
-来自[1.3.7]提取器
+来自[1.3.9]提取器
 ```
 
 ## 注意
