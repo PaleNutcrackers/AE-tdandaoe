@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TypedDict, TypeVar
 
 
-EXTRACTOR_VERSION = "1.3.9"
+EXTRACTOR_VERSION = "1.4.0"
 T = TypeVar("T")
 
 
@@ -527,22 +527,42 @@ def collect_aoe_skills(
             if target_count < min_targets:
                 continue
 
-            skill_key = confirmed_skill_key(event, index)
-            if action_id_filter and event.action_id not in action_id_filter and skill_key[1] not in action_id_filter:
-                continue
-            skills[skill_key] = max(skills.get(skill_key, 0), target_count)
+            for skill_key in confirmed_skill_keys(event, index):
+                if action_id_filter and event.action_id not in action_id_filter and skill_key[1] not in action_id_filter:
+                    continue
+                skills[skill_key] = max(skills.get(skill_key, 0), target_count)
 
     return skills
 
 
-def confirmed_skill_key(event: AbilityEvent, index: EventIndex) -> tuple[str, str]:
+def confirmed_skill_keys(event: AbilityEvent, index: EventIndex) -> list[tuple[str, str]]:
     if event.source_selectable_values == {True}:
-        return (event.name, event.action_id)
+        return [(event.name, event.action_id)]
+
+    parent_casts = find_selectable_parent_casts_by_name(event, index)
+    if parent_casts:
+        return [(cast.name, cast.action_id) for cast in parent_casts]
 
     parent_cast = find_selectable_parent_cast(event, index)
     if parent_cast is None:
-        return (event.name, event.action_id)
-    return (parent_cast.name, parent_cast.action_id)
+        return [(event.name, event.action_id)]
+    return [(parent_cast.name, parent_cast.action_id)]
+
+
+def find_selectable_parent_casts_by_name(event: AbilityEvent, index: EventIndex, parent_window_ms: int = 20000, sync_window_ms: int = 100) -> list[CastEvent]:
+    candidates: dict[tuple[int, str, str], CastEvent] = {}
+    for cast in index.casts_by_name.get(event.name, []):
+        if not cast.source_selectable:
+            continue
+        delay_ms = event.timestamp_ms - cast.timestamp_ms
+        if not 0 <= delay_ms <= parent_window_ms:
+            continue
+        candidates[(cast.timestamp_ms, cast.source_entity_id, cast.action_id)] = cast
+
+    if not candidates:
+        return []
+    latest_timestamp = max(key[0] for key in candidates)
+    return [cast for key, cast in candidates.items() if latest_timestamp - key[0] <= sync_window_ms]
 
 
 def find_selectable_parent_cast(event: AbilityEvent, index: EventIndex, parent_window_ms: int = 15000) -> CastEvent | None:
@@ -636,6 +656,16 @@ def count_window_targets(hit: AbilityHit, index: EventIndex, entity_catalog: Ent
             continue
         targets.add(candidate.target_entity_id)
     return len(targets)
+
+
+def count_detail_targets(detail: OutputDetail) -> int:
+    count_text, separator, _ = detail.hit_targets.partition(":")
+    if not separator:
+        return 0
+    try:
+        return int(count_text)
+    except ValueError:
+        return 0
 
 
 def score_confirmation_candidate(
@@ -772,6 +802,7 @@ def enrich_skill_rows(
     max_delay_ms: int,
     target_window_ms: int,
     linked_target_window_ms: int,
+    min_confirmed_targets: int = 1,
 ) -> dict[tuple[str, str], OutputDetail]:
     enriched: dict[tuple[str, str], OutputDetail] = {}
 
@@ -788,6 +819,8 @@ def enrich_skill_rows(
             linked_target_window_ms,
         )
         if detail is None:
+            continue
+        if count_detail_targets(detail) < min_confirmed_targets:
             continue
 
         detail.count = count
@@ -869,33 +902,48 @@ def write_structured_output(output_path: Path, version: str, records: list[Outpu
     raise ValueError(f"Unsupported output format: {output_format}")
 
 
-def validation_status(record: OutputRecord, action_ids: set[str]) -> str:
+def known_action_names(parsed_logs: ParsedLogData, action_ids: set[str]) -> set[str]:
+    names: set[str] = set()
+    for cast in parsed_logs.casts:
+        if cast.action_id in action_ids:
+            names.add(cast.name)
+    for hit in parsed_logs.hits:
+        if hit.action_id in action_ids:
+            names.add(hit.name)
+    return names
+
+
+def validation_status(record: OutputRecord, action_ids: set[str], action_names: set[str]) -> str:
     if record["skill_id"] in action_ids:
         return "matched_skill_id"
     if record["ability_id"] in action_ids:
         return "matched_ability_id"
+    if record["skill_name"] in action_names or record["ability_name"] in action_names:
+        return "matched_known_name"
     return "missing_from_actions"
 
 
-def validation_records(records: list[OutputRecord], action_ids: set[str]) -> list[ValidationRecord]:
+def validation_records(records: list[OutputRecord], action_ids: set[str], action_names: set[str]) -> list[ValidationRecord]:
     validated: list[ValidationRecord] = []
     for record in sort_output_records(records):
-        validated.append({**record, "validation_status": validation_status(record, action_ids)})
+        validated.append({**record, "validation_status": validation_status(record, action_ids, action_names)})
     return validated
 
 
-def write_validation_output(output_path: Path, version: str, records: list[OutputRecord], action_ids: set[str], output_format: str) -> None:
-    validated = validation_records(records, action_ids)
+def write_validation_output(output_path: Path, version: str, records: list[OutputRecord], action_ids: set[str], action_names: set[str], output_format: str) -> None:
+    validated = validation_records(records, action_ids, action_names)
     summary = {
         "total": len(validated),
         "matched_skill_id": sum(1 for record in validated if record["validation_status"] == "matched_skill_id"),
         "matched_ability_id": sum(1 for record in validated if record["validation_status"] == "matched_ability_id"),
+        "matched_known_name": sum(1 for record in validated if record["validation_status"] == "matched_known_name"),
         "missing_from_actions": sum(1 for record in validated if record["validation_status"] == "missing_from_actions"),
     }
+    missing_records = [record for record in validated if record["validation_status"] == "missing_from_actions"]
 
     if output_format == "json":
         with output_path.open("w", encoding="utf-8", newline="\n") as output:
-            json.dump({"version": version, "validation_summary": summary, "records": validated}, output, ensure_ascii=False, indent=2)
+            json.dump({"version": version, "validation_summary": summary, "records": missing_records}, output, ensure_ascii=False, indent=2)
             output.write("\n")
         return
 
@@ -904,7 +952,7 @@ def write_validation_output(output_path: Path, version: str, records: list[Outpu
         with output_path.open("w", encoding="utf-8-sig", newline="") as output:
             writer = csv.DictWriter(output, fieldnames=fieldnames)
             _ = writer.writeheader()
-            writer.writerows(validated)
+            writer.writerows(missing_records)
         return
 
     with output_path.open("w", encoding="utf-8", newline="\n") as output:
@@ -913,11 +961,10 @@ def write_validation_output(output_path: Path, version: str, records: list[Outpu
         output.write(f"total\t{summary['total']}\n")
         output.write(f"matched_skill_id\t{summary['matched_skill_id']}\n")
         output.write(f"matched_ability_id\t{summary['matched_ability_id']}\n")
+        output.write(f"matched_known_name\t{summary['matched_known_name']}\n")
         output.write(f"missing_from_actions\t{summary['missing_from_actions']}\n\n")
         output.write("状态\t分类\t技能名\tID\t数量\t技能使用到AbilityEffect耗时ms\tAbilityEffect名称/ID\t命中目标\n")
-        for record in validated:
-            if record["validation_status"] != "missing_from_actions":
-                continue
+        for record in missing_records:
             output.write(
                 f"{record['validation_status']}\t{record['category']}\t{record['skill_name']}\t{record['skill_id']}\t{record['count']}\t{record['delay_ms']}\t{record['ability_name']}/{record['ability_id']}\t{record['hit_targets']}\n"
             )
@@ -1160,6 +1207,7 @@ def main() -> int:
             args.max_effect_delay_ms,
             args.target_window_ms,
             args.linked_target_window_ms,
+            args.min_targets,
         )
         suspected_details = enrich_skill_rows(
             suspected,
@@ -1170,6 +1218,7 @@ def main() -> int:
             args.max_effect_delay_ms,
             args.target_window_ms,
             args.linked_target_window_ms,
+            args.min_targets,
         )
 
         output_lines.extend(format_category_block("确认的aoe", confirmed_details))
@@ -1196,6 +1245,7 @@ def main() -> int:
             args.max_effect_delay_ms,
             args.target_window_ms,
             args.linked_target_window_ms,
+            args.min_targets if args.include_derived_casts else 1,
         )
     else:
         skills = collect_aoe_skills(
@@ -1227,6 +1277,7 @@ def main() -> int:
             args.max_effect_delay_ms,
             args.target_window_ms,
             args.linked_target_window_ms,
+            args.min_targets if args.include_derived_casts else 1,
         )
     output_path = args.output if args.output.is_absolute() else script_dir / args.output
 
@@ -1247,7 +1298,7 @@ def main() -> int:
     if args.validate_actions is not None:
         action_path = args.validate_actions if args.validate_actions.is_absolute() else script_dir / args.validate_actions
         action_ids = load_action_id_file(action_path)
-        write_validation_output(output_path, EXTRACTOR_VERSION, structured_records, action_ids, args.output_format)
+        write_validation_output(output_path, EXTRACTOR_VERSION, structured_records, action_ids, known_action_names(parsed_logs, action_ids), args.output_format)
     elif args.output_format != "txt":
         write_structured_output(output_path, EXTRACTOR_VERSION, structured_records, args.output_format)
     else:
