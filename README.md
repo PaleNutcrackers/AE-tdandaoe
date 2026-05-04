@@ -2,7 +2,7 @@
 
 从 AEAssist BattleLog 日志中提取 AOE 技能。脚本会把技能读条、`AbilityEffect`、派生技能命中和命中目标串起来，输出更接近“真实可选中施法 ID”的结果。
 
-当前提取器版本：`1.4.0`
+当前提取器版本：`1.4.1`
 
 ## 现有功能
 
@@ -32,7 +32,7 @@ python extract_aoe_skills.py -all "Log-2354965 - 副本.log" -o aoe_skills.txt
 输出文本第一行会包含提取器版本：
 
 ```text
-来自[1.4.0]提取器
+来自[1.4.1]提取器
 ```
 
 ## 常用命令

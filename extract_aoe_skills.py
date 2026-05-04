@@ -17,13 +17,24 @@ import argparse
 import csv
 import json
 import re
+from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, TypeVar
 
 
-EXTRACTOR_VERSION = "1.4.0"
+EXTRACTOR_VERSION = "1.4.1"
+DEFAULT_EVENT_WINDOW_MS = 500
+DEFAULT_DERIVED_WINDOW_MS = 8000
+DEFAULT_MAX_EFFECT_DELAY_MS = 15000
+DEFAULT_TARGET_WINDOW_MS = 500
+DEFAULT_LINKED_TARGET_WINDOW_MS = 1500
+PARENT_NAME_WINDOW_MS = 20000
+PARENT_SYNC_WINDOW_MS = 100
+PARENT_FALLBACK_WINDOW_MS = 15000
+CHILD_PARENT_SYNC_WINDOW_MS = 1000
 T = TypeVar("T")
 
 
@@ -152,6 +163,25 @@ class EntityCatalog:
         return not self.player_entity_ids or entity_id in self.player_entity_ids
 
 
+@dataclass(slots=True)
+class SkillFilter:
+    source_name: str = ""
+    action_ids: set[str] = field(default_factory=new_catalog_set)
+    require_selectable: bool = True
+    require_name: bool = True
+
+    def matches(self, name: str, action_id: str, source_name: str, source_selectable: bool) -> bool:
+        if self.action_ids and action_id not in self.action_ids:
+            return False
+        if self.source_name and source_name != self.source_name:
+            return False
+        if self.require_selectable and not source_selectable:
+            return False
+        if self.require_name and not name:
+            return False
+        return True
+
+
 def new_cast_list() -> list[CastEvent]:
     return []
 
@@ -267,9 +297,16 @@ def parse_action_ids(raw_action_ids: str) -> set[str]:
 
 
 def load_action_id_file(path: Path) -> set[str]:
-    raw_ids = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw_ids = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Action ID file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Action ID file is not valid JSON: {path} ({exc.msg} at line {exc.lineno}, column {exc.colno})") from exc
+    except OSError as exc:
+        raise ValueError(f"Unable to read action ID file: {path} ({exc})") from exc
     if not isinstance(raw_ids, list):
-        raise ValueError("Action ID file must be a JSON array")
+        raise ValueError(f"Action ID file must be a JSON array: {path}")
     return {str(action_id) for action_id in raw_ids}
 
 
@@ -354,15 +391,22 @@ def parse_log_data(log_paths: list[Path], encoding: str, entity_catalog: EntityC
 
 def build_event_index(casts: list[CastEvent], hits: list[AbilityHit]) -> EventIndex:
     # 索引只按技能 ID/名称缩小候选范围，不在这里改变原始事件顺序。
-    index = EventIndex()
+    index = EventIndex(
+        casts_by_action=defaultdict(list),
+        casts_by_name=defaultdict(list),
+        casts_by_action_name=defaultdict(list),
+        hits_by_action=defaultdict(list),
+        hits_by_name=defaultdict(list),
+        hits_by_action_name=defaultdict(list),
+    )
     for cast in casts:
-        index.casts_by_action.setdefault(cast.action_id, []).append(cast)
-        index.casts_by_name.setdefault(cast.name, []).append(cast)
-        index.casts_by_action_name.setdefault((cast.action_id, cast.name), []).append(cast)
+        index.casts_by_action[cast.action_id].append(cast)
+        index.casts_by_name[cast.name].append(cast)
+        index.casts_by_action_name[(cast.action_id, cast.name)].append(cast)
     for hit in hits:
-        index.hits_by_action.setdefault(hit.action_id, []).append(hit)
-        index.hits_by_name.setdefault(hit.name, []).append(hit)
-        index.hits_by_action_name.setdefault((hit.action_id, hit.name), []).append(hit)
+        index.hits_by_action[hit.action_id].append(hit)
+        index.hits_by_name[hit.name].append(hit)
+        index.hits_by_action_name[(hit.action_id, hit.name)].append(hit)
     for cast_list in index.casts_by_action.values():
         cast_list.sort(key=lambda cast: cast.timestamp_ms)
     for cast_list in index.casts_by_name.values():
@@ -378,27 +422,18 @@ def build_event_index(casts: list[CastEvent], hits: list[AbilityHit]) -> EventIn
     return index
 
 
-def passes_filter(name: str, action_id: str, source_name: str, source_selectable: bool, source_name_filter: str, action_id_filter: set[str]) -> bool:
-    if action_id_filter and action_id not in action_id_filter:
-        return False
-    if source_name_filter and source_name != source_name_filter:
-        return False
-    if not source_selectable:
-        return False
-    if not name:
-        return False
-    return True
+def passes_filter(name: str, action_id: str, source_name: str, source_selectable: bool, skill_filter: SkillFilter) -> bool:
+    return skill_filter.matches(name, action_id, source_name, source_selectable)
 
 
 def collect_cast_skills(
     casts: list[CastEvent],
-    source_name_filter: str,
-    action_id_filter: set[str],
+    skill_filter: SkillFilter,
 ) -> dict[tuple[str, str, str], int]:
     skills: dict[tuple[str, str, str], int] = {}
 
     for cast in casts:
-        if not passes_filter(cast.name, cast.action_id, cast.source_name, cast.source_selectable, source_name_filter, action_id_filter):
+        if not passes_filter(cast.name, cast.action_id, cast.source_name, cast.source_selectable, skill_filter):
             continue
         key = (cast.source_name, cast.name, cast.action_id)
         skills[key] = skills.get(key, 0) + 1
@@ -408,13 +443,12 @@ def collect_cast_skills(
 
 def group_cast_suspicion(
     casts: list[CastEvent],
-    source_name_filter: str,
-    action_id_filter: set[str],
+    skill_filter: SkillFilter,
 ) -> dict[tuple[str, str], int]:
     grouped: dict[tuple[str, str], set[str]] = {}
 
     for cast in casts:
-        if not passes_filter(cast.name, cast.action_id, cast.source_name, cast.source_selectable, source_name_filter, action_id_filter):
+        if not passes_filter(cast.name, cast.action_id, cast.source_name, cast.source_selectable, skill_filter):
             continue
 
         # 同一技能由多个可选中来源施放过，说明可能是机制技能，但还没有多人命中证据。
@@ -440,8 +474,7 @@ def iter_ability_hits(log_paths: list[Path], encoding: str) -> list[AbilityHit]:
 def collect_parent_skills_with_derived_casts(
     casts: list[CastEvent],
     index: EventIndex,
-    source_name_filter: str,
-    action_id_filter: set[str],
+    skill_filter: SkillFilter,
     derived_name_filter: str,
     derived_window_ms: int,
     min_derived_casts: int,
@@ -451,7 +484,7 @@ def collect_parent_skills_with_derived_casts(
     candidate_children = index.casts_by_name.get(derived_name_filter, []) if derived_name_filter else ordered_casts
 
     for parent in ordered_casts:
-        if not passes_filter(parent.name, parent.action_id, parent.source_name, parent.source_selectable, source_name_filter, action_id_filter):
+        if not passes_filter(parent.name, parent.action_id, parent.source_name, parent.source_selectable, skill_filter):
             continue
 
         derived_sources_by_name: dict[str, set[str]] = {}
@@ -549,7 +582,12 @@ def confirmed_skill_keys(event: AbilityEvent, index: EventIndex) -> list[tuple[s
     return [(parent_cast.name, parent_cast.action_id)]
 
 
-def find_selectable_parent_casts_by_name(event: AbilityEvent, index: EventIndex, parent_window_ms: int = 20000, sync_window_ms: int = 100) -> list[CastEvent]:
+def find_selectable_parent_casts_by_name(
+    event: AbilityEvent,
+    index: EventIndex,
+    parent_window_ms: int = PARENT_NAME_WINDOW_MS,
+    sync_window_ms: int = PARENT_SYNC_WINDOW_MS,
+) -> list[CastEvent]:
     candidates: dict[tuple[int, str, str], CastEvent] = {}
     for cast in index.casts_by_name.get(event.name, []):
         if not cast.source_selectable:
@@ -565,7 +603,7 @@ def find_selectable_parent_casts_by_name(event: AbilityEvent, index: EventIndex,
     return [cast for key, cast in candidates.items() if latest_timestamp - key[0] <= sync_window_ms]
 
 
-def find_selectable_parent_cast(event: AbilityEvent, index: EventIndex, parent_window_ms: int = 15000) -> CastEvent | None:
+def find_selectable_parent_cast(event: AbilityEvent, index: EventIndex, parent_window_ms: int = PARENT_FALLBACK_WINDOW_MS) -> CastEvent | None:
     if len(event.source_entity_ids) == 1:
         source_entity_id = next(iter(event.source_entity_ids))
         return find_selectable_parent_cast_for_source(event, source_entity_id, index, parent_window_ms)
@@ -610,7 +648,7 @@ def find_selectable_parent_cast_for_source(
             continue
         if cast.timestamp_ms > child_cast.timestamp_ms:
             continue
-        if child_cast.timestamp_ms - cast.timestamp_ms > 1000:
+        if child_cast.timestamp_ms - cast.timestamp_ms > CHILD_PARENT_SYNC_WINDOW_MS:
             continue
         return cast
     return None
@@ -625,7 +663,7 @@ def merge_skill_counts(
     return base
 
 
-def unique_by_identity(items: list[T]) -> list[T]:
+def unique_by_identity(items: Iterable[T]) -> list[T]:
     seen: set[int] = set()
     unique: list[T] = []
     for item in items:
@@ -638,16 +676,24 @@ def unique_by_identity(items: list[T]) -> list[T]:
 
 
 def candidate_casts_for_skill(name: str, action_id: str, index: EventIndex) -> list[CastEvent]:
-    return unique_by_identity(index.casts_by_action.get(action_id, []) + index.casts_by_name.get(name, []))
+    return unique_by_identity(
+        item
+        for bucket in (index.casts_by_action.get(action_id, []), index.casts_by_name.get(name, []))
+        for item in bucket
+    )
 
 
 def candidate_hits_for_skill(name: str, action_id: str, index: EventIndex) -> list[AbilityHit]:
-    return unique_by_identity(index.hits_by_action.get(action_id, []) + index.hits_by_name.get(name, []))
+    return unique_by_identity(
+        item
+        for bucket in (index.hits_by_action.get(action_id, []), index.hits_by_name.get(name, []))
+        for item in bucket
+    )
 
 
-def count_window_targets(hit: AbilityHit, index: EventIndex, entity_catalog: EntityCatalog, target_window_ms: int) -> int:
+def count_window_targets(hit: AbilityHit, hit_bucket: list[AbilityHit], entity_catalog: EntityCatalog, target_window_ms: int) -> int:
     targets: set[str] = set()
-    for candidate in index.hits_by_action_name.get((hit.action_id, hit.name), []):
+    for candidate in hit_bucket:
         if candidate.source_entity_id != hit.source_entity_id:
             continue
         if not entity_catalog.should_keep_entity(candidate.target_entity_id):
@@ -711,7 +757,7 @@ def find_skill_confirmation(
     best_hit: AbilityHit | None = None
 
     def has_matching_derived_cast(hit: AbilityHit, parent_cast: CastEvent) -> bool:
-        for child_cast in index.casts_by_action_name.get((hit.action_id, hit.name), []):
+        for child_cast in casts_by_action_name.get((hit.action_id, hit.name), []):
             if child_cast.source_selectable:
                 continue
             if child_cast.timestamp_ms < parent_cast.timestamp_ms:
@@ -723,6 +769,9 @@ def find_skill_confirmation(
 
     candidate_casts = candidate_casts_for_skill(name, action_id, index)
     candidate_hits = candidate_hits_for_skill(name, action_id, index)
+    casts_by_action_name = index.casts_by_action_name
+    hits_by_action_name = index.hits_by_action_name
+    target_count_cache: dict[tuple[int, str, str, str], int] = {}
 
     for cast in candidate_casts:
         if not cast.source_selectable:
@@ -737,7 +786,12 @@ def find_skill_confirmation(
             if hit.action_id != action_id and hit.name != name:
                 continue
 
-            direct_target_count = count_window_targets(hit, index, entity_catalog, target_window_ms)
+            hit_bucket = hits_by_action_name.get((hit.action_id, hit.name), [])
+            target_count_key = (hit.timestamp_ms, hit.source_entity_id, hit.action_id, hit.name)
+            direct_target_count = target_count_cache.get(target_count_key)
+            if direct_target_count is None:
+                direct_target_count = count_window_targets(hit, hit_bucket, entity_catalog, target_window_ms)
+                target_count_cache[target_count_key] = direct_target_count
             score = score_confirmation_candidate(
                 action_id,
                 expected_count,
@@ -762,7 +816,7 @@ def find_skill_confirmation(
     if best_detail is not None and best_cast is not None and best_hit is not None:
         targets: dict[str, str] = {}
         # 先收集最佳 AbilityEffect 同一时间窗内的直接命中目标。
-        for hit in index.hits_by_action_name.get((best_hit.action_id, best_hit.name), []):
+        for hit in hits_by_action_name.get((best_hit.action_id, best_hit.name), []):
             if hit.action_id != best_hit.action_id or hit.name != best_hit.name:
                 continue
             if abs(hit.timestamp_ms - best_hit.timestamp_ms) > target_window_ms:
@@ -1016,8 +1070,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--event-window-ms",
         type=int,
-        default=500,
-        help="Merge same skill/source hits within this many ms as one event. Default: 500",
+        default=DEFAULT_EVENT_WINDOW_MS,
+        help=f"Merge same skill/source hits within this many ms as one event. Default: {DEFAULT_EVENT_WINDOW_MS}",
     )
     parser.add_argument(
         "--include-blank-names",
@@ -1057,8 +1111,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--derived-window-ms",
         type=int,
-        default=8000,
-        help="Window after a parent cast for derived cast detection. Default: 8000",
+        default=DEFAULT_DERIVED_WINDOW_MS,
+        help=f"Window after a parent cast for derived cast detection. Default: {DEFAULT_DERIVED_WINDOW_MS}",
     )
     parser.add_argument(
         "--min-derived-casts",
@@ -1069,20 +1123,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-effect-delay-ms",
         type=int,
-        default=15000,
-        help="Maximum delay from selectable cast to related AbilityEffect. Default: 15000",
+        default=DEFAULT_MAX_EFFECT_DELAY_MS,
+        help=f"Maximum delay from selectable cast to related AbilityEffect. Default: {DEFAULT_MAX_EFFECT_DELAY_MS}",
     )
     parser.add_argument(
         "--target-window-ms",
         type=int,
-        default=500,
-        help="Window for grouping AbilityEffect targets into one hit list. Default: 500",
+        default=DEFAULT_TARGET_WINDOW_MS,
+        help=f"Window for grouping AbilityEffect targets into one hit list. Default: {DEFAULT_TARGET_WINDOW_MS}",
     )
     parser.add_argument(
         "--linked-target-window-ms",
         type=int,
-        default=1500,
-        help="Window after a derived AbilityEffect for linked follow-up hit targets. Default: 1500",
+        default=DEFAULT_LINKED_TARGET_WINDOW_MS,
+        help=f"Window after a derived AbilityEffect for linked follow-up hit targets. Default: {DEFAULT_LINKED_TARGET_WINDOW_MS}",
     )
     parser.add_argument(
         "--validate-actions",
@@ -1142,6 +1196,7 @@ def main() -> int:
     validate_args(args)
 
     action_id_filter = parse_action_ids(args.action_ids)
+    skill_filter = SkillFilter(source_name=args.source_name, action_ids=action_id_filter)
 
     entity_catalog = EntityCatalog() if args.no_player_prefilter else build_entity_catalog(log_paths, args.encoding)
     parsed_logs = parse_log_data(log_paths, args.encoding, entity_catalog)
@@ -1168,8 +1223,7 @@ def main() -> int:
         high_suspected = collect_parent_skills_with_derived_casts(
             parsed_logs.casts,
             event_index,
-            args.source_name,
-            action_id_filter,
+            skill_filter,
             args.derived_name,
             args.derived_window_ms,
             args.min_derived_casts,
@@ -1181,8 +1235,7 @@ def main() -> int:
         )
         suspected = group_cast_suspicion(
             parsed_logs.casts,
-            args.source_name,
-            action_id_filter,
+            skill_filter,
         )
         for key in list(confirmed.keys()) + list(high_suspected.keys()):
             # 按“确认 > 高度疑似 > 疑似”去重，避免同一技能重复输出。
@@ -1227,8 +1280,7 @@ def main() -> int:
     elif args.from_casts:
         cast_skills = collect_cast_skills(
             parsed_logs.casts,
-            args.source_name,
-            action_id_filter,
+            skill_filter,
         )
         cast_detail_rows: dict[tuple[str, str], int] = {}
         for (_, name, action_id), cast_count in cast_skills.items():
@@ -1261,8 +1313,7 @@ def main() -> int:
             derived_skills = collect_parent_skills_with_derived_casts(
                 parsed_logs.casts,
                 event_index,
-                args.source_name,
-                action_id_filter,
+                skill_filter,
                 args.derived_name,
                 args.derived_window_ms,
                 args.min_derived_casts,
@@ -1344,4 +1395,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(f"error: {exc}")
