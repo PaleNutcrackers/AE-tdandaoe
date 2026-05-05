@@ -22,7 +22,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, TypeVar
+from typing import TypedDict, TypeVar, cast
 
 
 EXTRACTOR_VERSION = "1.4.1"
@@ -298,7 +298,7 @@ def parse_action_ids(raw_action_ids: str) -> set[str]:
 
 def load_action_id_file(path: Path) -> set[str]:
     try:
-        raw_ids = json.loads(path.read_text(encoding="utf-8"))
+        raw_ids: object = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ValueError(f"Action ID file not found: {path}") from exc
     except json.JSONDecodeError as exc:
@@ -307,7 +307,8 @@ def load_action_id_file(path: Path) -> set[str]:
         raise ValueError(f"Unable to read action ID file: {path} ({exc})") from exc
     if not isinstance(raw_ids, list):
         raise ValueError(f"Action ID file must be a JSON array: {path}")
-    return {str(action_id) for action_id in raw_ids}
+    action_id_list = cast(list[object], raw_ids)
+    return {str(action_id) for action_id in action_id_list}
 
 
 def numeric_text(value: str) -> int:
@@ -569,13 +570,17 @@ def collect_aoe_skills(
 
 
 def confirmed_skill_keys(event: AbilityEvent, index: EventIndex) -> list[tuple[str, str]]:
+    # 可选中来源直接造成多人命中时，AbilityEffect 本身就是可输出的真实技能。
     if event.source_selectable_values == {True}:
         return [(event.name, event.action_id)]
 
+    # 不可选中派生来源造成命中时，优先找同名、可选中的父读条。
+    # 同一机制可能几乎同时有多个可选中父读条，例如双 Boss 同名技能，需全部保留。
     parent_casts = find_selectable_parent_casts_by_name(event, index)
     if parent_casts:
         return [(cast.name, cast.action_id) for cast in parent_casts]
 
+    # 同名父读条找不到时，再按派生来源回溯最近的可选中父读条；多来源必须共同指向同一个父技能才归并。
     parent_cast = find_selectable_parent_cast(event, index)
     if parent_cast is None:
         return [(event.name, event.action_id)]
@@ -588,6 +593,8 @@ def find_selectable_parent_casts_by_name(
     parent_window_ms: int = PARENT_NAME_WINDOW_MS,
     sync_window_ms: int = PARENT_SYNC_WINDOW_MS,
 ) -> list[CastEvent]:
+    # 同名归并用于处理“真实可选中读条 -> 同名不可选中派生命中”的日志形态。
+    # 只取最新一批同步窗口内的父读条，避免把更早轮次的同名技能也归到同一次命中。
     candidates: dict[tuple[int, str, str], CastEvent] = {}
     for cast in index.casts_by_name.get(event.name, []):
         if not cast.source_selectable:
@@ -604,6 +611,7 @@ def find_selectable_parent_casts_by_name(
 
 
 def find_selectable_parent_cast(event: AbilityEvent, index: EventIndex, parent_window_ms: int = PARENT_FALLBACK_WINDOW_MS) -> CastEvent | None:
+    # 多个不可选中来源只有共同回溯到同一个可选中父读条时才安全归并；否则保留原 AbilityEffect。
     if len(event.source_entity_ids) == 1:
         source_entity_id = next(iter(event.source_entity_ids))
         return find_selectable_parent_cast_for_source(event, source_entity_id, index, parent_window_ms)
@@ -628,6 +636,7 @@ def find_selectable_parent_cast_for_source(
     index: EventIndex,
     parent_window_ms: int,
 ) -> CastEvent | None:
+    # 第一步：在同名读条里找到该不可选中来源对应的最近子读条。
     child_cast: CastEvent | None = None
     for cast in index.casts_by_name.get(event.name, []):
         if cast.source_selectable:
@@ -643,6 +652,7 @@ def find_selectable_parent_cast_for_source(
     if child_cast is None:
         return None
 
+    # 第二步：从子读条向前找同步窗口内最近的可选中父读条，得到最终输出用的真实施法 ID。
     for cast in reversed(index.casts_by_name.get(event.name, [])):
         if not cast.source_selectable:
             continue
@@ -751,12 +761,15 @@ def find_skill_confirmation(
     target_window_ms: int,
     linked_target_window_ms: int,
 ) -> OutputDetail | None:
+    # 补全输出详情分三步：先找候选可选中读条和相关 AbilityEffect，再按评分选最可信配对，最后收集命中目标。
+    # 这块不决定“是不是 AOE”，只为已收集到的技能键找出延迟、实际命中 ID 和玩家目标列表。
     best_score: tuple[int, int, int, int, int, int] | None = None
     best_detail: OutputDetail | None = None
     best_cast: CastEvent | None = None
     best_hit: AbilityHit | None = None
 
     def has_matching_derived_cast(hit: AbilityHit, parent_cast: CastEvent) -> bool:
+        # 若父读条和命中之间存在同名同 ID 的不可选中子读条，则这个命中更可能是该父技能的派生结果。
         for child_cast in casts_by_action_name.get((hit.action_id, hit.name), []):
             if child_cast.source_selectable:
                 continue
@@ -773,6 +786,7 @@ def find_skill_confirmation(
     hits_by_action_name = index.hits_by_action_name
     target_count_cache: dict[tuple[int, str, str, str], int] = {}
 
+    # 候选配对允许“读条 ID”和“命中 ID”不同，只要名称或 ID 能关联上；评分会优先真实多人目标和更精确的 ID。
     for cast in candidate_casts:
         if not cast.source_selectable:
             continue
@@ -786,6 +800,7 @@ def find_skill_confirmation(
             if hit.action_id != action_id and hit.name != name:
                 continue
 
+            # 同一次 AbilityEffect 的目标数可能被多个候选读条重复查询，按时间/来源/技能缓存窗口计数。
             hit_bucket = hits_by_action_name.get((hit.action_id, hit.name), [])
             target_count_key = (hit.timestamp_ms, hit.source_entity_id, hit.action_id, hit.name)
             direct_target_count = target_count_cache.get(target_count_key)
@@ -828,7 +843,7 @@ def find_skill_confirmation(
 
         should_include_linked_targets = best_hit.action_id != action_id or len(targets) < expected_count
         if should_include_linked_targets:
-            # 派生技能可能先命中单人，再由后续非可选中来源打出真正的群体命中。
+            # 派生技能可能先命中单人,这里单人可能并不是玩家，再由后续非可选中来源打出真正的群体命中。
             for hit in hits:
                 delay_from_best_hit = hit.timestamp_ms - best_hit.timestamp_ms
                 if not 0 < delay_from_best_hit <= linked_target_window_ms:
